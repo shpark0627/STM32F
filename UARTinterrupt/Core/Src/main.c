@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <stdio.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -71,10 +72,21 @@ PUTCHAR_PROTOTYPE
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-uint8_t pc_rx_data;
-uint8_t board_rx_data;
+#define MAX_LEN 100
 
-uint8_t pc_rx_buffer[100];
+// PC(USART2) 관련
+uint8_t pc_data;             // 1바이트 수신용
+char pc_buffer[MAX_LEN];     // 문장 보관용
+uint8_t pc_idx = 0;
+
+// ID 관련 변수
+char id[20] = "User";        // 초기 ID (기본값)
+uint8_t is_id_mode = 0;
+
+// 상대 보드(USART1) 관련
+uint8_t board_data;          // 1바이트 수신용
+char board_buffer[MAX_LEN];  // 문장 보관용
+uint8_t board_idx = 0;
 
 /* USER CODE END 0 */
 
@@ -110,10 +122,10 @@ int main(void)
   MX_USART2_UART_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-
+  HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_5);
   // 수신 인터럽트 활성화 (1바이트를 받으면 인터럽트 발생)
-  HAL_UART_Receive_IT(&huart2, &pc_rx_data, 1);
-  HAL_UART_Receive_IT(&huart1, &board_rx_data, 1);
+  HAL_UART_Receive_IT(&huart2, &pc_data, 1);
+  HAL_UART_Receive_IT(&huart1, &board_data, 1);
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -281,16 +293,103 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
-	if(huart->Instance == USART2){
-		HAL_UART_Transmit(&huart2, &pc_rx_data, 1, 10);
-		HAL_UART_Transmit(&huart1, &pc_rx_data, 1, 10);
-		HAL_UART_Receive_IT(&huart2, &pc_rx_data, 1);
-	}
 
-	if(huart->Instance==USART1){
-		HAL_UART_Transmit(&huart2, &board_rx_data, 1, 10);
-		HAL_UART_Receive_IT(&huart1, &board_rx_data, 1);
-	}
+	if (huart->Instance == USART2) {
+	        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, 0);
+
+	        // [A] Tab 키(\t)를 눌렀을 때 -> ID 변경 모드로 진입
+	        if (pc_data == '\t' || pc_data == 0x09) {
+	            is_id_mode = 1;       // 모드 변경
+	            pc_idx = 0;           // 버퍼 초기화
+
+	            // 안내 메시지 출력
+	            char *msg = "\r\n[System] Input User ID: ";
+	            HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+	        }
+
+	        else if (pc_data == 0x08){
+	        	char clear_command[] = "\033[1D\033[K";
+	        	pc_buffer[pc_idx--] = '\0';
+				HAL_UART_Transmit(&huart2, (uint8_t*)clear_command, strlen(clear_command), HAL_MAX_DELAY);
+	        }
+
+	        else if (pc_data == 0x7F || pc_data == '1'){
+	        	char clear_command[] = "\033[2J\033[H";
+	        	HAL_UART_Transmit(&huart2, (uint8_t*)clear_command, strlen(clear_command), HAL_MAX_DELAY);
+
+	        }
+
+	        // [B] 엔터 키(\r, \n)를 눌렀을 때
+	        else if (pc_data == '\r' || pc_data == '\n') {
+	            if (pc_idx > 0) {
+	                pc_buffer[pc_idx] = '\0'; // 문자열 마무리
+
+	                // --- 상황 1: ID 입력 모드였다면? ---
+	                if (is_id_mode == 1) {
+	                    strcpy(id, pc_buffer); // ID 변경 적용!
+	                    is_id_mode = 0;        // 다시 채팅 모드로 복귀
+
+	                    // 1. 나에게 알림
+	                    char log_msg[120];
+	                    sprintf(log_msg, "\r\n[System] ID -> [%s]\r\n", id);
+	                    HAL_UART_Transmit(&huart2, (uint8_t*)log_msg, strlen(log_msg), 100);
+
+	                    // 2. 상대방에게 알림 (선택사항)
+	                    char send_msg[120];
+	                    sprintf(send_msg, "\r\n[Info] The other person ID -> [%s]\r\n", id);
+	                    HAL_UART_Transmit(&huart1, (uint8_t*)send_msg, strlen(send_msg), 100);
+	                }
+
+	                // --- 상황 2: 그냥 채팅 모드였다면? ---
+	                else {
+	                    // 1. 상대방에게 전송 (내 ID를 붙여서!)
+	                    char send_msg[150];
+	                    sprintf(send_msg, "[%s]: %s\r\n", id, pc_buffer); // 예: [Seung]: 안녕
+	                    HAL_UART_Transmit(&huart1, (uint8_t*)send_msg, strlen(send_msg), 100);
+
+	                    // 2. 내 화면에 표시
+	                    char log_msg[150];
+	                    sprintf(log_msg, "\r\n[%s]: %s\r\n", id, pc_buffer);
+	                    HAL_UART_Transmit(&huart2, (uint8_t*)log_msg, strlen(log_msg), 100);
+	                }
+	                pc_idx = 0; // 버퍼 비우기
+	            }
+	        }
+
+	        // [C] 일반 글자 입력 (엔터, 탭 아님)
+	        else {
+	            if (pc_idx < MAX_LEN - 1) {
+	                pc_buffer[pc_idx++] = pc_data;
+	                // 에코(Echo): 내가 친 글자 화면에 보여주기
+	                HAL_UART_Transmit(&huart2, &pc_data, 1, 10);
+	            }
+	        }
+	        HAL_UART_Receive_IT(&huart2, &pc_data, 1);
+	    }
+
+
+	    if (huart->Instance == USART1) { // 상대 보드로부터 데이터가 왔을 때
+
+	        if (board_data == '\r' || board_data == '\n') {
+	            if (board_idx > 0) {
+	                board_buffer[board_idx] = '\0';
+
+	                char log_msg[120];
+	                sprintf(log_msg, "\r\n%s\r\n", board_buffer);
+	                HAL_UART_Transmit(&huart2, (uint8_t*)log_msg, strlen(log_msg), 100);
+	                HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, 1);
+
+	                board_idx = 0;
+	            }
+	        }
+	        else {
+	            if (board_idx < MAX_LEN - 1) {
+	                board_buffer[board_idx++] = board_data;
+
+	            }
+	        }
+	        HAL_UART_Receive_IT(&huart1, &board_data, 1);
+	    }
 }
 
 /* USER CODE END 4 */
